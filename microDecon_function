@@ -1,0 +1,261 @@
+#' @title Decontaminate the phyloseq object using the microdecon package (https://github.com/donaldtmcknight/microDecon )
+#' @author Sneha Sundar
+#' @param physeq The phyloseq object
+#' @param grouping_var The name of the metadata column you want to group your samples by: e.g sequencing run or plate .
+#' @param sample_type_var The metadata column that indicates whether a sample is a negative control or not
+#' @param NTC_label The label given to the negative control samples in the \code{sample_type} column
+#' @param taxa_info Default TRUE. logical vector indicating that you want taxonomic information of the otus as well
+#' @param taxa_level What level of taxonomic information is needed ? e.g "Strain","Genus"
+#' @param facet_plot The name of the column in the metadata that should be used for faceting in the diagnostic bar plot
+#' @param taxa_plot The taxa level to plot in the diagnostic bar plot
+#' @param run_groupwise logical. If TRUE , will run the decon function separately for every group. See note for why this might be helpful.
+#' @return p
+#' A list containing the result of the decon function (\code{result.microDecon}),
+#' and a diagnostic bar plot of the relative abundances of ASVs that are totally removed from all the groups
+#' for all the samples (\code{diagnostic.plot} and the decontaminated phyloseq object5)
+#' If \code{run_groupwise} is TRUE, it will return a list and each element of the list is the output (as defined above with the microDecon function result, the diagnostic plot and the decontaminated phyloseq object) of doing the decontamination for each group separately .
+#' @export
+#' @examples
+#' phyloseq_remove_contaminants_microDecon(physeq=physeq,
+#'                                        grouping_var=plate,
+#'                                        sample_type_var=Experiment,
+#'                                        NTC_label="NTC",
+#'                                        taxa_info=TRUE,
+#'                                        taxa_level='Strain',
+#'                                        facet_plot='Reactor',
+#'                                        taxa_plot='Order')
+#' @note
+#' For the microdecontam approach we need to provide the data to the function in a specifically formatted dataframe:
+#' rows are OTUs each column is individual sample .
+#' First column: OTU ID
+#' last column: taxonomic info (optional)
+#' From column 2 : negative control samples (if there is more than one negative control , they will be averaged to produce a single mean negative control)*
+#'
+#'   The rest of the samples should be grouped by population ID, species, or some other sensible a priori grouping criteria (i.e., treat these groups as experimental blocks). For example PCR_plate can be the grouping criterion because that is where we are anticipating batch effects to play out.
+#'
+#' It is a good idea to see if the negative controls are similar or heterogenous. If they are heterogenous it is a good idea to run the function separately on the different groups (provided of course you have negative controls specifically for each group). You can do this by setting argument \code{run_groupwise} to TRUE
+
+#' DON"T NORMALIZE READS BEFORE RUNNING FUNCTION
+
+#'
+phyloseq_remove_contaminants_microDecon <- function(physeq,
+                                                    grouping_var,
+                                                    sample_type_var,
+                                                    NTC_label,
+                                                    taxa_info=TRUE,
+                                                    taxa_level,
+                                                    facet_plot = NULL ,
+                                                    taxa_plot,
+                                                    run_groupwise=FALSE,
+                                                    runs = 2,
+                                                    thresh = 0.7,
+                                                    prop.thresh = 0.00005,
+                                                    low.threshold = 40,
+                                                    up.threshold = 400){
+
+  require(phyloseq)
+  require(tidyverse)
+  require(microDecon)
+
+  #adding the strain level annotation to the asvs (ie. instead of ASV1,ASV2..,etc, we now have strain level annotation as taxa_names())
+
+  if("Strain" %in% rank_names(physeq)  && taxa_level == "Strain")
+  {
+    taxa_names(physeq)  <- tax_table(physeq)[,"Strain"]
+
+
+  }
+
+  #defining an operator 'not in'
+  '%!in%' <- function(x,y)!('%in%'(x,y))
+
+  if("Strain" %!in% rank_names(physeq)  && taxa_level == "Strain")
+  {
+    physeq %>%
+      phyloseq_get_strains_fast() -> physeq
+
+    taxa_names(physeq)  <- tax_table(physeq)[,"Strain"]
+
+  }
+
+
+  if(run_groupwise==TRUE){
+
+    #run the decontamination separately for each group
+
+    result.run_groupwise <- vector("list",length(unique(physeq %>% get_variable(grouping_var))))
+
+    groups <- unique(physeq %>% get_variable(grouping_var))
+    for(i in 1:length(groups)){
+      physeq.subset<-prune_samples(sample_data(physeq)[[grouping_var]]==groups[i],physeq)
+
+      #sample_data(physeq) as a dataframe
+      as(sample_data(physeq.subset),"matrix") %>%
+        data.frame(check.names=FALSE) %>%
+        rownames_to_column("Sample_ID") -> sample.data
+
+      #group and arrange `sample.data`according to the grouping variable (e.g Plate or Batch number or sequencing run)
+      sample.data<-sample.data %>% group_by(.data[[grouping_var]]) %>% arrange(.data[[grouping_var]])
+
+      #get the grouped sample ids: we will use this to format the otu table
+      grouped_sample_ids<-sample.data$Sample_ID
+
+      #get otu table as dataframe
+      as(otu_table(physeq.subset),"matrix") %>% data.frame(check.names=FALSE) %>% rownames_to_column("OTU_ID") -> otu.df
+
+      #checking if we need taxonomic information of the ASVs and adding them if needed
+      if(taxa_info == TRUE){
+        tax.table <- as(tax_table(physeq.subset),"matrix") %>% data.frame(check.names=FALSE ) %>% rownames_to_column('ASV')
+        taxa <- tax.table[,taxa_level]
+        otu.df<-otu.df %>% mutate(Taxa = taxa)
+      }
+
+      #formatting the otu table in the way required by microDecon
+      otu.df<-otu.df %>% relocate(all_of(grouped_sample_ids),.after=OTU_ID)
+
+      NTC.df <- sample.data %>% filter(.data[[sample_type_var]] == NTC_label)
+
+      NTC_samples<- NTC.df$Sample_ID
+
+      otu.df<-otu.df %>% relocate(all_of(NTC_samples),.after=OTU_ID)  #formatted table
+
+      #number of negative controls
+      n.blanks = length(NTC_samples)
+
+      #vector of numbers listing the number of individuals in each user-specified group
+      numb.ind<-sample.data %>% filter(.data[[sample_type_var]]!=NTC_label) %>% group_size()
+
+      #performing decontamination:
+
+      result<-decon(data=otu.df,
+                    numb.blanks = n.blanks,
+                    numb.ind = numb.ind,
+                    taxa = T,
+                    runs = runs,
+                    thresh = thresh,
+                    prop.thresh = prop.thresh,
+                    regression = 0,
+                    low.threshold = low.threshold,
+                    up.threshold = up.threshold)
+
+      #type ?decon() in the console for more info about other parameters and how the result is formatted
+
+
+      otu_removed_df<-result$OTUs.removed
+
+      #otus removed from all groups
+      otus_totally_removed <- otu_removed_df[otu_removed_df$All.groups=="Totally.removed","OTU_ID"]
+
+
+      physeq.subset %>%
+        transform_sample_counts(function(x) x/sum(x) *100)  -> physeq.subset_tmp
+
+      #Creating a diagnostic bar plot of relative abundances of the ASVs (at the taxonomic level indicated in `taxa_plot`) removed from all groups. Facet wrap according to `facet_plot`.
+
+      prune_taxa(otus_totally_removed, physeq.subset_tmp) %>%
+        plot_bar(fill= taxa_plot) +
+        facet_wrap(.~get(facet_plot),scales="free_x") +
+        theme(plot.title = element_text(hjust = 0.5)) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 3)) -> p1.microDecon
+
+      #updating the otu table of physeq.subset object with decontaminated otu table
+      physeq.decon <- physeq.subset
+      otu_table(physeq.decon) <- otu_table(result$decon.table %>% select(-any_of(c("Mean.blank","Taxa"))) %>% remove_rownames() %>% column_to_rownames("OTU_ID") %>% data.matrix(),taxa_are_rows = TRUE)
+
+      result.run_groupwise[[i]]<- list("result.microDecon" = result,
+                                       "diagnostic.plot" = p1.microDecon,
+                                       "physeq.decontaminated" = physeq.decon)
+
+    }
+
+    #name the result
+    naming_fun <- function(x){return(paste(grouping_var,x,sep = "_"))}
+
+    names(result.run_groupwise) <-c(sapply(as.character(groups),naming_fun,USE.NAMES = FALSE))
+
+
+    return(result.run_groupwise)
+
+
+  }else{
+    #sample_data(physeq) as a dataframe
+    as(sample_data(physeq),"matrix") %>%
+      data.frame(check.names=FALSE) %>%
+      rownames_to_column("Sample_ID") -> sample.data
+
+    #group and arrange `sample.data`according to the grouping variable (e.g Plate or Batch number or sequencing run)
+    sample.data<-sample.data %>% group_by(.data[[grouping_var]]) %>% arrange(.data[[grouping_var]])
+
+    #get the grouped sample ids: we will use this to format the otu table
+    grouped_sample_ids<-sample.data$Sample_ID
+
+    #get otu table as dataframe
+    as(otu_table(physeq),"matrix") %>% data.frame(check.names=FALSE) %>% rownames_to_column("OTU_ID") -> otu.df
+
+    #checking if we need taxonomic information of the ASVs and adding them if needed
+    if(taxa_info == TRUE){
+      tax.table <- as(tax_table(physeq),"matrix") %>% data.frame(check.names=FALSE ) %>% rownames_to_column('ASV')
+      taxa <- tax.table[,taxa_level]
+      otu.df<-otu.df %>% mutate(Taxa = taxa)
+    }
+
+    #formatting the otu table in the way required by microDecon
+    otu.df<-otu.df %>% relocate(all_of(grouped_sample_ids),.after=OTU_ID)
+
+    NTC.df <- sample.data %>% filter(.data[[sample_type_var]] == NTC_label)
+
+    NTC_samples<- NTC.df$Sample_ID
+
+    otu.df<-otu.df %>% relocate(all_of(NTC_samples),.after=OTU_ID)  #formatted table
+
+    #number of negative controls
+    n.blanks = length(NTC_samples)
+
+    #vector of numbers listing the number of individuals in each user-specified group
+    numb.ind<-sample.data %>% filter(.data[[sample_type_var]]!=NTC_label) %>% group_size()
+
+    #performing decontamination:
+
+    result<-decon(data=otu.df,
+                  numb.blanks = n.blanks,
+                  numb.ind = numb.ind,
+                  taxa = T,
+                  runs = runs,
+                  thresh = thresh,
+                  prop.thresh = prop.thresh,
+                  regression = 0,
+                  low.threshold = low.threshold,
+                  up.threshold = up.threshold)
+
+    #type ?decon() in the console for more info about other parameters and how the result is formatted
+
+
+    otu_removed_df<-result$OTUs.removed
+
+    #otus removed from all groups
+    otus_totally_removed <- otu_removed_df[otu_removed_df$All.groups=="Totally.removed","OTU_ID"]
+
+
+    physeq %>%
+      transform_sample_counts(function(x) x/sum(x) *100)  -> physeq_tmp
+
+    #Creating a diagnostic bar plot of relative abundances of the ASVs (at the taxonomic level indicated in `taxa_plot`) removed from all groups. Facet wrap according to `facet_plot`.
+
+    prune_taxa(otus_totally_removed, physeq_tmp) %>%
+      plot_bar(fill= taxa_plot) +
+      facet_wrap(.~get(facet_plot),scales="free_x") +
+      theme(plot.title = element_text(hjust = 0.5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 3)) -> p1.microDecon
+
+    #updating the otu table of physeq object with decontaminated otu table
+    physeq.decon <- physeq
+    otu_table(physeq.decon) <- otu_table(result$decon.table %>% select(-any_of(c("Mean.blank","Taxa"))) %>% remove_rownames() %>% column_to_rownames("OTU_ID") %>% data.matrix(),taxa_are_rows = TRUE)
+
+    out <- list("result.microDecon" = result,
+                "diagnostic.plot" = p1.microDecon,
+                "physeq.decontaminated" = physeq.decon)
+    return(out)
+  }
+
+
+}
