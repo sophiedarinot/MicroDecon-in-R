@@ -1,7 +1,7 @@
 # MicroDecon-in-R
 Written by Sneha Sundar, decontaminate phyloseq object in R using microDecon package
 
-microDecon uses the following variables: grouping_var (useful if you have sequences from different runs), NTC_label (label used to identify the blanks).
+microDecon uses the following variables: *grouping_var* (useful if you have sequences from different runs), *NTC_label* (label used to identify the blanks).
 
 You should add those variables to the metadata of your phyloseq object.
 
