@@ -5,7 +5,7 @@ microDecon uses the following variables: *grouping_var* (useful if you have sequ
 
 You should add those variables to the metadata of your phyloseq object.
 
-For example :
+Here's an example on the metadata before making the phyloseq object:
 ```
 # All the samples are from the same run
 metadata <- metadata %>%
