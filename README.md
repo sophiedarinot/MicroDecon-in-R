@@ -18,7 +18,7 @@ metadata <- metadata %>%
     .default = "NTC"
   ))
 ```
-And an example of running the function:
+And an example of running the function after making the phyloseq object:
 ```
 # The phyloseq object is called "ps"
 ps <- phyloseq_remove_contaminants_microDecon(ps, grouping_var = "Run", sample_type_var = "Experiment", NTC_label = "NTC", 
